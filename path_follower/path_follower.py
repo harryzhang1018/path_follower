@@ -33,6 +33,7 @@
 
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import ParameterDescriptor
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist, PoseStamped, TwistStamped
 from chrono_ros_interfaces.msg import DriverInputs as VehicleInput
@@ -64,6 +65,19 @@ class ControlNode(Node):
         # update frequency of this node
         self.freq = 10.0
 
+        # declare parameters:
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('controller', 'mpc', ParameterDescriptor(description='controller types selection')),
+                ('ref_path', 'path_iros_1', ParameterDescriptor(description='reference path selection')),
+                ('exp_index', 1, ParameterDescriptor(description='experiments index'))
+            ]
+        )
+        # Access the parameters
+        self.controller = self.get_parameter('controller').get_parameter_value().string_value
+        self.ref_path = self.get_parameter('ref_path').get_parameter_value().string_value
+        self.exp_index = self.get_parameter('exp_index').get_parameter_value().integer_value
         # READ IN SHARE DIRECTORY LOCATION
         package_share_directory = get_package_share_directory('path_follower')
         # initialize control inputs
@@ -84,8 +98,9 @@ class ControlNode(Node):
         self.go = False
         self.vehicle_cmd = VehicleInput()
         self.lidar_data = LaserScan()
-        self.model = load_model('/sbel/Desktop/ros_ws/src/nn_models_lib/single_speed_MPC_IL_NN.keras')
-        self.file = open("/sbel/Desktop/waypoints_paths/path_iros_2.csv")
+        self.model_hd = load_model('/sbel/Desktop/ros_ws/src/nn_models_lib/single_speed_MC_IL_NN.keras')
+        self.model_mpc = load_model('/sbel/Desktop/ros_ws/src/nn_models_lib/single_speed_MPC_IL_NN.keras')
+        self.file = open("/sbel/Desktop/waypoints_paths/"+ self.ref_path +".csv")
         self.ref_traj = np.loadtxt(self.file,delimiter=",")
         self.lookahead = 1.0
         # publishers and subscribers
@@ -117,7 +132,7 @@ class ControlNode(Node):
         self.v = np.sqrt(msg.twist.linear.x ** 2 + msg.twist.linear.y ** 2)
             
     
-    def error_state(self):
+    def error_state(self,lookahead):
         
         x_current = self.x
         y_current = self.y
@@ -132,7 +147,7 @@ class ControlNode(Node):
 
         dist = np.zeros((1,len(self.ref_traj[:,1])))
         for i in range(len(self.ref_traj[:,1])):
-            dist[0][i] = dist[0][i] = (x_current+np.cos(theta_current)*self.lookahead-self.ref_traj[i][0])**2+(y_current+np.sin(theta_current)*self.lookahead-self.ref_traj[i][1])**2
+            dist[0][i] = dist[0][i] = (x_current+np.cos(theta_current)*lookahead-self.ref_traj[i][0])**2+(y_current+np.sin(theta_current)*lookahead-self.ref_traj[i][1])**2
         index = dist.argmin()
 
         ref_state_current = list(self.ref_traj[index,:])
@@ -173,26 +188,44 @@ class ControlNode(Node):
         if(not self.go):
             return
         ## get error state
-        e = self.error_state()
-        self.get_logger().info('error state: %s' % e)
-        ## NN controller 
-        start_time = time.time()
-        error_input = np.array(e).reshape(1,-1)
-        ctrl_nn = self.model.predict(error_input)
-        self.throttle = ctrl_nn[0][0]
-        steering = ctrl_nn[0][1] 
-        self.get_logger().info('solving time: %s' % (time.time() - start_time))
+        e = self.error_state(1.0)
+        ## get lateral tracking error
+        e_tracking = self.error_state(0.0)
         
-        ## MPC controller
-        # start_time = time.time()
-        # self.throttle, steering = mpc_wpts_solver(e,[self.throttle,self.steering], self.v, 1)
-        # steering = steering * 1.6667
-        # self.get_logger().info('solving time: %s' % (time.time() - start_time))
-        ## PID Controller
-        # start_time = time.time()
-        # self.throttle = sum([x * y for x, y in zip(e, [0.37013526 ,0.00507144, 0.15476554 ,1.0235402 ])])
-        # steering = sum([x * y for x, y in zip(e, [0.02176878 , 0.72672704 , 0.78409284 ,-0.0105355 ])])
-        # self.get_logger().info('solving time: %s' % (time.time() - start_time))
+        self.get_logger().info('error state: %s' % e)
+        
+        if self.controller == 'nnhd':
+            ## NN controller 
+            start_time = time.time()
+            error_input = np.array(e).reshape(1,-1)
+            ctrl_nn = self.model_hd.predict(error_input)
+            self.throttle = ctrl_nn[0][0]
+            steering = ctrl_nn[0][1] 
+            self.get_logger().info('solving time: %s' % (time.time() - start_time))
+            
+        elif self.controller == 'nnmpc':
+            ## NN controller 
+            start_time = time.time()
+            error_input = np.array(e).reshape(1,-1)
+            ctrl_nn = self.model_mpc.predict(error_input)
+            self.throttle = ctrl_nn[0][0]
+            steering = ctrl_nn[0][1] 
+            self.get_logger().info('solving time: %s' % (time.time() - start_time))
+            
+        elif self.controller == 'mpc':
+            # MPC controller
+            start_time = time.time()
+            self.throttle, steering = mpc_wpts_solver(e,[self.throttle,self.steering], self.v, 1)
+            ## convert steering angle to steering comand
+            steering = steering * 1.6667
+            self.get_logger().info('solving time: %s' % (time.time() - start_time))
+            
+        else:
+            ## PID Controller
+            start_time = time.time()
+            self.throttle = sum([x * y for x, y in zip(e, [0.37013526 ,0.00507144, 0.15476554 ,1.0235402 ])])
+            steering = sum([x * y for x, y in zip(e, [0.02176878 , 0.72672704 , 0.78409284 ,-0.0105355 ])])
+            self.get_logger().info('solving time: %s' % (time.time() - start_time))
         
         # ensure steering can't change too much between timesteps, smooth transition
         delta_steering = steering - self.steering
@@ -202,20 +235,20 @@ class ControlNode(Node):
         else:
             self.steering = steering
         
-        ### for vehicle one
+        ### for vehicle input
         msg = VehicleInput()
         msg.steering = np.clip(self.steering, -1.0, 1.0)
         msg.throttle = np.clip(self.throttle, 0, 1)
         msg.braking = np.clip(self.braking, 0, 1)
-        ### for vehicle two
-        #self.get_logger().info("sending vehicle inputs: %s" % msg)
+
         self.pub_vehicle_cmd.publish(msg)
-        
-        with open ('sim_pid.csv','a', encoding='UTF8') as csvfile:
-                my_writer = csv.writer(csvfile, quoting=csv.QUOTE_NONE, escapechar=' ')
-                #for row in pt:
-                my_writer.writerow([self.x, self.y, self.theta, e[0],e[1],e[2],e[3],msg.throttle,msg.steering])
-                csvfile.close()
+        ### for recording vehicle state, trajectory etc.
+        # file_name = './Ttest_e03/' + 'test_' + str(self.exp_index) + '_' + self.controller + '.csv'
+        # with open (file_name,'a', encoding='UTF8') as csvfile:
+        #         my_writer = csv.writer(csvfile, quoting=csv.QUOTE_NONE, escapechar=' ')
+        #         #for row in pt:
+        #         my_writer.writerow([self.x, self.y, self.theta, e[0],e[1],e[2],e[3],msg.throttle,msg.steering,e_tracking[0],e_tracking[1],e_tracking[2],e_tracking[3]])
+        #         csvfile.close()
 
 
 

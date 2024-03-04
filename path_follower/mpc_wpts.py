@@ -152,8 +152,8 @@ def mpc_wpts_solver(e,u,vel,vel_ref):
         u[:nx] = -x0
         prob.update(l=l, u=u)
     
-    print('For the error state: e=',e )
-    print('Control input:',ctrl)
+    # print('For the error state: e=',e )
+    # print('Control input:',ctrl)
     
     #print('Next predict state',x0)
         #print(res.x)
